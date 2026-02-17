@@ -6,7 +6,8 @@ import type { LanguageModelUsage, ToolUIPart } from 'ai';
 import './App.css'
 import z from 'zod';
 import { Button } from './components/ui/button';
-import { CheckIcon, LoaderIcon, ArrowUp, PanelLeftIcon, PanelRightIcon, Square, X, ChevronLeftIcon, ChevronRightIcon, SquarePen } from 'lucide-react';
+import { CheckIcon, LoaderIcon, ArrowUp, PanelLeftIcon, PanelRightIcon, Square, X, ChevronLeftIcon, ChevronRightIcon, SquarePen, Plus, Paperclip } from 'lucide-react';
+import { isImageMime, getMimeFromExtension, getFileDisplayName, getExtension } from '@/lib/file-utils';
 import { cn } from '@/lib/utils';
 import { MarkdownEditor } from './components/markdown-editor';
 import { ChatInputBar } from './components/chat-button';
@@ -66,10 +67,21 @@ interface TreeNode extends DirEntry {
   loaded?: boolean
 }
 
+type StagedAttachment = {
+  id: string;
+  path: string;
+  filename: string;
+  mediaType: string;
+  isImage: boolean;
+  size: number;
+  thumbnailUrl?: string;
+}
+
 interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  attachments?: { type: string; path: string; filename: string; mediaType: string; size?: number }[];
   timestamp: number;
 }
 
@@ -292,9 +304,11 @@ const collectDirPaths = (nodes: TreeNode[]): string[] =>
 const collectFilePaths = (nodes: TreeNode[]): string[] =>
   nodes.flatMap(n => n.kind === 'file' ? [n.path] : (n.children ? collectFilePaths(n.children) : []))
 
+const MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024 // 10MB
+
 // Inner component that uses the controller to access mentions
 interface ChatInputInnerProps {
-  onSubmit: (message: PromptInputMessage, mentions?: FileMention[]) => void
+  onSubmit: (message: PromptInputMessage, mentions?: FileMention[], attachments?: StagedAttachment[]) => void
   onStop?: () => void
   isProcessing: boolean
   isStopping?: boolean
@@ -314,7 +328,44 @@ function ChatInputInner({
 }: ChatInputInnerProps) {
   const controller = usePromptInputController()
   const message = controller.textInput.value
-  const canSubmit = Boolean(message.trim()) && !isProcessing
+  const [attachments, setAttachments] = useState<StagedAttachment[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const canSubmit = (Boolean(message.trim()) || attachments.length > 0) && !isProcessing
+
+  const addFiles = useCallback(async (paths: string[]) => {
+    const newAttachments: StagedAttachment[] = []
+    for (const filePath of paths) {
+      try {
+        const result = await window.ipc.invoke('shell:readFileBase64', { path: filePath })
+        if (result.size > MAX_ATTACHMENT_SIZE) {
+          toast.error(`File too large: ${getFileDisplayName(filePath)} (max 10MB)`)
+          continue
+        }
+        const mime = result.mimeType || getMimeFromExtension(getExtension(filePath))
+        const isImage = isImageMime(mime)
+        const attachment: StagedAttachment = {
+          id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          path: filePath,
+          filename: getFileDisplayName(filePath),
+          mediaType: mime,
+          isImage,
+          size: result.size,
+          thumbnailUrl: isImage ? `data:${mime};base64,${result.data}` : undefined,
+        }
+        newAttachments.push(attachment)
+      } catch (err) {
+        console.error('Failed to read file:', filePath, err)
+        toast.error(`Failed to read: ${getFileDisplayName(filePath)}`)
+      }
+    }
+    if (newAttachments.length > 0) {
+      setAttachments(prev => [...prev, ...newAttachments])
+    }
+  }, [])
+
+  const removeAttachment = useCallback((id: string) => {
+    setAttachments(prev => prev.filter(a => a.id !== id))
+  }, [])
 
   // Handle preset message from suggestions
   useEffect(() => {
@@ -326,10 +377,11 @@ function ChatInputInner({
 
   const handleSubmit = useCallback(() => {
     if (!canSubmit) return
-    onSubmit({ text: message.trim(), files: [] }, controller.mentions.mentions)
+    onSubmit({ text: message.trim(), files: [] }, controller.mentions.mentions, attachments)
     controller.textInput.clear()
     controller.mentions.clearMentions()
-  }, [canSubmit, message, onSubmit, controller])
+    setAttachments([])
+  }, [canSubmit, message, onSubmit, controller, attachments])
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -351,13 +403,9 @@ function ChatInputInner({
       if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
         const paths = Array.from(e.dataTransfer.files)
           .map((f) => window.electronUtils?.getPathForFile(f))
-          .filter(Boolean)
+          .filter(Boolean) as string[]
         if (paths.length > 0) {
-          const currentText = controller.textInput.value
-          const pathText = paths.join(' ')
-          controller.textInput.setInput(
-            currentText ? `${currentText} ${pathText}` : pathText
-          )
+          addFiles(paths)
         }
       }
     }
@@ -367,50 +415,101 @@ function ChatInputInner({
       document.removeEventListener("dragover", onDragOver)
       document.removeEventListener("drop", onDrop)
     }
-  }, [controller])
+  }, [addFiles])
 
   return (
-    <div className="flex items-center gap-2 bg-background border border-border rounded-lg shadow-none px-4 py-4">
-      <PromptInputTextarea
-        placeholder="Type your message..."
-        onKeyDown={handleKeyDown}
-        autoFocus
-        focusTrigger={runId}
-        className="min-h-6 py-0 border-0 shadow-none focus-visible:ring-0 rounded-none"
-      />
-      {isProcessing ? (
-        <Button
-          size="icon"
-          onClick={onStop}
-          title={isStopping ? "Click again to force stop" : "Stop generation"}
-          className={cn(
-            "h-7 w-7 rounded-full shrink-0 transition-all",
-            isStopping
-              ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              : "bg-primary text-primary-foreground hover:bg-primary/90"
-          )}
-        >
-          {isStopping ? (
-            <LoaderIcon className="h-4 w-4 animate-spin" />
-          ) : (
-            <Square className="h-3 w-3 fill-current" />
-          )}
-        </Button>
-      ) : (
-        <Button
-          size="icon"
-          onClick={handleSubmit}
-          disabled={!canSubmit}
-          className={cn(
-            "h-7 w-7 rounded-full shrink-0 transition-all",
-            canSubmit
-              ? "bg-primary text-primary-foreground hover:bg-primary/90"
-              : "bg-muted text-muted-foreground"
-          )}
-        >
-          <ArrowUp className="h-4 w-4" />
-        </Button>
+    <div className="bg-background border border-border rounded-lg shadow-none">
+      {/* Attachment pills */}
+      {attachments.length > 0 && (
+        <div className="flex flex-wrap gap-1.5 px-4 pt-3 pb-1">
+          {attachments.map((att) => (
+            <span
+              key={att.id}
+              className="inline-flex items-center gap-1.5 text-xs bg-muted text-muted-foreground px-2 py-1 rounded-md"
+            >
+              {att.isImage && att.thumbnailUrl ? (
+                <img src={att.thumbnailUrl} alt="" className="size-4 rounded object-cover" />
+              ) : (
+                <Paperclip className="size-3" />
+              )}
+              <span className="max-w-[120px] truncate">{att.filename}</span>
+              <button
+                type="button"
+                onClick={() => removeAttachment(att.id)}
+                className="hover:text-foreground transition-colors"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
+          ))}
+        </div>
       )}
+      <div className="flex items-center gap-2 px-4 py-4">
+        {/* Plus button for file attachments */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            const files = e.target.files
+            if (!files || files.length === 0) return
+            const paths = Array.from(files)
+              .map((f) => window.electronUtils?.getPathForFile(f))
+              .filter(Boolean) as string[]
+            if (paths.length > 0) addFiles(paths)
+            e.target.value = ''
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => fileInputRef.current?.click()}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+          aria-label="Attach files"
+        >
+          <Plus className="h-4 w-4" />
+        </button>
+        <PromptInputTextarea
+          placeholder="Type your message..."
+          onKeyDown={handleKeyDown}
+          autoFocus
+          focusTrigger={runId}
+          className="min-h-6 py-0 border-0 shadow-none focus-visible:ring-0 rounded-none"
+        />
+        {isProcessing ? (
+          <Button
+            size="icon"
+            onClick={onStop}
+            title={isStopping ? "Click again to force stop" : "Stop generation"}
+            className={cn(
+              "h-7 w-7 rounded-full shrink-0 transition-all",
+              isStopping
+                ? "bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                : "bg-primary text-primary-foreground hover:bg-primary/90"
+            )}
+          >
+            {isStopping ? (
+              <LoaderIcon className="h-4 w-4 animate-spin" />
+            ) : (
+              <Square className="h-3 w-3 fill-current" />
+            )}
+          </Button>
+        ) : (
+          <Button
+            size="icon"
+            onClick={handleSubmit}
+            disabled={!canSubmit}
+            className={cn(
+              "h-7 w-7 rounded-full shrink-0 transition-all",
+              canSubmit
+                ? "bg-primary text-primary-foreground hover:bg-primary/90"
+                : "bg-muted text-muted-foreground"
+            )}
+          >
+            <ArrowUp className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
     </div>
   )
 }
@@ -420,7 +519,7 @@ interface ChatInputWithMentionsProps {
   knowledgeFiles: string[]
   recentFiles: string[]
   visibleFiles: string[]
-  onSubmit: (message: PromptInputMessage, mentions?: FileMention[]) => void
+  onSubmit: (message: PromptInputMessage, mentions?: FileMention[], attachments?: StagedAttachment[]) => void
   onStop?: () => void
   isProcessing: boolean
   isStopping?: boolean
@@ -1047,6 +1146,7 @@ function App() {
             if (msg.role === 'user' || msg.role === 'assistant') {
               // Extract text content from message
               let textContent = ''
+              let msgAttachments: ChatMessage['attachments'] = undefined
               if (typeof msg.content === 'string') {
                 textContent = msg.content
               } else if (Array.isArray(msg.content)) {
@@ -1055,7 +1155,13 @@ function App() {
                   .filter((part: { type: string }) => part.type === 'text')
                   .map((part: { type: string; text?: string }) => part.text || '')
                   .join('')
-                
+
+                // Extract attachment parts (for user messages)
+                const attParts = msg.content.filter((part: { type: string }) => part.type === 'attachment')
+                if (attParts.length > 0) {
+                  msgAttachments = attParts.map((part: { type: string; attachment: { type: string; path: string; filename: string; mediaType: string; size?: number } }) => part.attachment)
+                }
+
                 // Also extract tool-call parts from assistant messages
                 if (msg.role === 'assistant') {
                   for (const part of msg.content) {
@@ -1073,11 +1179,12 @@ function App() {
                   }
                 }
               }
-              if (textContent) {
+              if (textContent || msgAttachments) {
                 items.push({
                   id: event.messageId,
                   role: msg.role,
                   content: textContent,
+                  attachments: msgAttachments,
                   timestamp: event.ts ? new Date(event.ts).getTime() : Date.now(),
                 })
               }
@@ -1469,20 +1576,32 @@ function App() {
     }
   }
 
-  const handlePromptSubmit = async (message: PromptInputMessage, mentions?: FileMention[]) => {
+  const handlePromptSubmit = async (message: PromptInputMessage, mentions?: FileMention[], stagedAttachments?: StagedAttachment[]) => {
     if (isProcessing) return
 
     const { text } = message;
     const userMessage = text.trim()
-    if (!userMessage) return
+    const hasAttachments = stagedAttachments && stagedAttachments.length > 0
+    if (!userMessage && !hasAttachments) return
 
     setMessage('')
 
     const userMessageId = `user-${Date.now()}`
+    // Build attachment metadata for optimistic display
+    const displayAttachments = hasAttachments
+      ? stagedAttachments.map(a => ({
+          type: a.isImage ? 'image' : 'file',
+          path: a.path,
+          filename: a.filename,
+          mediaType: a.mediaType,
+          size: a.size,
+        }))
+      : undefined
     setConversation(prev => [...prev, {
       id: userMessageId,
       role: 'user',
       content: userMessage,
+      attachments: displayAttachments,
       timestamp: Date.now(),
     }])
 
@@ -1498,33 +1617,81 @@ function App() {
         isNewRun = true
       }
 
-      // Read mentioned file contents and format message with XML context
-      let formattedMessage = userMessage
-      if (mentions && mentions.length > 0) {
-        const attachedFiles = await Promise.all(
-          mentions.map(async (m) => {
-            try {
-              const result = await window.ipc.invoke('workspace:readFile', { path: m.path })
-              return { path: m.path, content: result.data as string }
-            } catch (err) {
-              console.error('Failed to read mentioned file:', m.path, err)
-              return { path: m.path, content: `[Error reading file: ${m.path}]` }
-            }
-          })
-        )
+      if (hasAttachments) {
+        // New path: build UserContentPart[] with attachments
+        type ContentPart =
+          | { type: 'text'; text: string }
+          | { type: 'attachment'; attachment: { type: 'file' | 'image'; path: string; filename: string; mediaType: string; size?: number } }
 
-        if (attachedFiles.length > 0) {
-          const filesXml = attachedFiles
-            .map(f => `<file path="${f.path}">\n${f.content}\n</file>`)
-            .join('\n')
-          formattedMessage = `<attached-files>\n${filesXml}\n</attached-files>\n\n${userMessage}`
+        const contentParts: ContentPart[] = []
+
+        // @-mention files → attachment parts
+        if (mentions && mentions.length > 0) {
+          for (const m of mentions) {
+            contentParts.push({
+              type: 'attachment',
+              attachment: {
+                type: 'file',
+                path: m.path,
+                filename: m.displayName || m.path.split('/').pop() || m.path,
+                mediaType: 'text/markdown',
+              },
+            })
+          }
         }
-      }
 
-      await window.ipc.invoke('runs:createMessage', {
-        runId: currentRunId,
-        message: formattedMessage,
-      })
+        // Staged file/image attachments
+        for (const att of stagedAttachments) {
+          contentParts.push({
+            type: 'attachment',
+            attachment: {
+              type: att.isImage ? 'image' : 'file',
+              path: att.path,
+              filename: att.filename,
+              mediaType: att.mediaType,
+              size: att.size,
+            },
+          })
+        }
+
+        // User's typed text
+        if (userMessage) {
+          contentParts.push({ type: 'text', text: userMessage })
+        }
+
+        await window.ipc.invoke('runs:createMessage', {
+          runId: currentRunId,
+          message: contentParts,
+        })
+      } else {
+        // Legacy path: plain string (with optional XML-formatted @-mentions)
+        let formattedMessage = userMessage
+        if (mentions && mentions.length > 0) {
+          const attachedFiles = await Promise.all(
+            mentions.map(async (m) => {
+              try {
+                const result = await window.ipc.invoke('workspace:readFile', { path: m.path })
+                return { path: m.path, content: result.data as string }
+              } catch (err) {
+                console.error('Failed to read mentioned file:', m.path, err)
+                return { path: m.path, content: `[Error reading file: ${m.path}]` }
+              }
+            })
+          )
+
+          if (attachedFiles.length > 0) {
+            const filesXml = attachedFiles
+              .map(f => `<file path="${f.path}">\n${f.content}\n</file>`)
+              .join('\n')
+            formattedMessage = `<attached-files>\n${filesXml}\n</attached-files>\n\n${userMessage}`
+          }
+        }
+
+        await window.ipc.invoke('runs:createMessage', {
+          runId: currentRunId,
+          message: formattedMessage,
+        })
+      }
 
       // Refresh runs list after message is sent (so title is available)
       if (isNewRun) {
@@ -2167,6 +2334,32 @@ function App() {
   const renderConversationItem = (item: ConversationItem) => {
     if (isChatMessage(item)) {
       if (item.role === 'user') {
+        if (item.attachments && item.attachments.length > 0) {
+          // New-format: render attachment pills from structured data
+          return (
+            <Message key={item.id} from={item.role}>
+              <MessageContent>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {item.attachments.map((att, index) => (
+                    <span
+                      key={index}
+                      className="inline-flex items-center gap-1.5 text-xs bg-muted text-muted-foreground px-2 py-1 rounded-md"
+                    >
+                      {isImageMime(att.mediaType) ? (
+                        <span className="size-3 rounded bg-primary/20" />
+                      ) : (
+                        <Paperclip className="size-3" />
+                      )}
+                      {att.filename}
+                    </span>
+                  ))}
+                </div>
+                {item.content}
+              </MessageContent>
+            </Message>
+          )
+        }
+        // Old-format: parse XML @-mentions
         const { message, files } = parseAttachedFiles(item.content)
         return (
           <Message key={item.id} from={item.role}>
